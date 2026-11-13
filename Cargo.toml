@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = ["contracts/collection", "contracts/item", "tests"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "LicenseRef-Proprietary"
+authors = ["Michael McClanahan (github.com/tnvolman)"]
+repository = "https://github.com/tnvolman/onhire"
+
+[workspace.dependencies]
+near-sdk = "5.30.1"
+near-contract-standards = "5.30.1"
+
+[profile.release]
+codegen-units = 1
+opt-level = "z"
+lto = true
+debug = false
+panic = "abort"
+overflow-checks = true

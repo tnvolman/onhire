@@ -1,0 +1,18 @@
+target/
+**/*.wasm
+logs/
+.env
+.env.*
+.env*
+*.key
+*.pem
+.claude/
+.leapfrog-lock
+# key / credential JSON (no ordinary project JSON is ignored)
+*.secret.json
+*credentials*.json
+**/*-key.json
+**/*_key.json
+*.testnet.json
+*.mainnet.json
+.near-credentials/

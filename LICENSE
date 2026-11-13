@@ -1,0 +1,35 @@
+Copyright (c) 2026 Michael McClanahan (github.com/tnvolman)
+All rights reserved.
+
+This license covers the Onhire source code and documentation in this
+repository (the "Software"). It does not affect ownership of any NFT or
+other on-chain asset minted or used with the Software. Third-party
+components remain under their own licenses.
+
+No permission is granted to copy, modify, distribute, or use the
+Software, except as follows.
+
+Limited grant for NEAR HACKATHON. The official organizers, judges, and
+official screening reviewers of NEAR HACKATHON (https://nearhackathon.com)
+may copy, clone, build, review, and run the Software solely to evaluate
+this entry, through the official results announcement (currently
+2026-11-18 23:59 UTC) and any official extension of that judging period.
+This grant does not include sublicensing, commercial use, publishing a
+modified version, or deploying the Software as a service. When the
+period ends, this grant ends.
+
+This limited grant is in addition to, and does not limit, the
+organizers' non-exclusive promotional rights to the project name,
+screenshots, video, and repository link under the official rules (Q-013).
+Those rules do not otherwise grant rights in the Software (Q-014 allows
+any license).
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT.
+IN NO EVENT SHALL THE COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES,
+OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT, OR
+OTHERWISE, ARISING FROM, OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR
+THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+All other rights are reserved.
