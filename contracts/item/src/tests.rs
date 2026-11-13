@@ -48,6 +48,30 @@ fn locked_box() -> BoxContract {
     c
 }
 
+/// Owner offers a lease (1 yocto) and the lessee accepts it, attaching
+/// `deposit`.
+fn offer(c: &mut BoxContract, deposit: u128) {
+    testing_env!(ctx("owner.near", 1).build());
+    c.start_lease(acc("lessee.near"), U128(NEAR), 86_400, U128(deposit));
+}
+
+fn lease(c: &mut BoxContract, deposit: u128) {
+    offer(c, deposit);
+    testing_env!(ctx("lessee.near", deposit).build());
+    c.accept_lease();
+}
+
+fn fails<F: FnOnce()>(f: F, needle: &str) {
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    let e = r.expect_err(&format!("expected panic {needle}"));
+    let msg = e
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
+        .unwrap_or_default();
+    assert!(msg.contains(needle), "wanted {needle}, got {msg}");
+}
+
 fn callback_ctx(result: PromiseResult) {
     let b = ctx("box-0001.onhire.test.near", 0);
     testing_env!(
@@ -62,8 +86,7 @@ fn callback_ctx(result: PromiseResult) {
 #[test]
 fn reserve_split_is_15_percent() {
     let mut c = setup();
-    testing_env!(ctx("owner.near", 1).build());
-    c.start_lease(acc("lessee.near"), U128(NEAR), 86_400);
+    lease(&mut c, NEAR);
     testing_env!(ctx("lessee.near", 10_000).build());
     c.pay_hire();
     assert_eq!(c.reserve, 1_500);
@@ -146,8 +169,8 @@ fn rescue_refuses_unknown_owner() {
 #[should_panic(expected = "ERR_SALE_LOCKED")]
 fn pay_hire_rejected_while_locked() {
     let mut c = setup();
+    lease(&mut c, NEAR);
     testing_env!(ctx("owner.near", 1).build());
-    c.start_lease(acc("lessee.near"), U128(NEAR), 86_400);
     c.list(U128(NEAR));
     testing_env!(ctx("buyer.near", NEAR).build());
     let _ = c.buy();
@@ -220,8 +243,7 @@ fn split_fails_closed_when_owner_share_cannot_cover_fee() {
 #[test]
 fn pay_hire_100_yocto_sends_1_to_fee_account() {
     let mut c = setup();
-    testing_env!(ctx("owner.near", 1).build());
-    c.start_lease(acc("lessee.near"), U128(NEAR), 86_400);
+    lease(&mut c, NEAR);
     let reserve0 = c.reserve;
     testing_env!(ctx("lessee.near", 100).build());
     c.pay_hire();
@@ -236,8 +258,7 @@ fn pay_hire_100_yocto_sends_1_to_fee_account() {
 #[test]
 fn sale_100_yocto_credits_99_and_fee_1_reserve_untouched() {
     let mut c = setup();
-    testing_env!(ctx("owner.near", 1).build());
-    c.start_lease(acc("lessee.near"), U128(NEAR), 86_400);
+    lease(&mut c, NEAR);
     testing_env!(ctx("lessee.near", 100).build());
     c.pay_hire();
     let reserve = c.reserve;
@@ -259,8 +280,7 @@ fn sale_100_yocto_credits_99_and_fee_1_reserve_untouched() {
 #[should_panic(expected = "ERR_FEE_EXCEEDS_OWNER_SHARE")]
 fn pay_hire_reverts_when_owner_share_cannot_cover_fee() {
     let mut c = setup();
-    testing_env!(ctx("owner.near", 1).build());
-    c.start_lease(acc("lessee.near"), U128(NEAR), 86_400);
+    lease(&mut c, NEAR);
     c.reserve_bps = 9_950; // hypothetical: leaves the owner 0.5%
     testing_env!(ctx("lessee.near", 10_000).build());
     c.pay_hire();
@@ -275,4 +295,334 @@ fn buy_reverts_before_locking_when_fee_exceeds_price() {
     c.fee_bps = 20_000; // hypothetical: fee is 200% of the price
     testing_env!(ctx("buyer.near", 100).build());
     let _ = c.buy();
+}
+
+// ------------------------------------------------- two-step lease (offer/accept)
+
+fn ctx_at(pred: &str, deposit: u128, secs: u64) -> VMContextBuilder {
+    let mut b = ctx(pred, deposit);
+    b.block_timestamp(secs * NANOS_PER_SEC);
+    b
+}
+
+#[test]
+fn offer_holds_nothing_and_accept_starts_clock_with_lessee_deposit() {
+    let mut c = setup();
+    offer(&mut c, 3 * NEAR);
+    assert!(c.lease.is_none());
+    assert_eq!(c.held_deposits(), 0);
+    let o = c.get_lease_offer().unwrap();
+    assert_eq!(o.lessee, acc("lessee.near"));
+    assert_eq!(o.deposit, U128(3 * NEAR));
+    assert_eq!(o.duration_secs, 86_400);
+    assert_eq!(o.offered_by, acc("owner.near"));
+    assert!(get_logs().iter().any(|l| l.contains("\"event\":\"lease_offered\"")));
+
+    // Accepted later: the clock starts at accept time, not offer time.
+    testing_env!(ctx_at("lessee.near", 3 * NEAR, 5_000).build());
+    c.accept_lease();
+    assert!(get_logs().iter().any(|l| l.contains("\"event\":\"lease_started\"")));
+    assert!(c.get_lease_offer().is_none());
+    let l = c.get_lease().unwrap();
+    assert_eq!(l.lessee, acc("lessee.near"));
+    assert_eq!((l.start_ts, l.end_ts), (5_000, 5_000 + 86_400));
+    assert_eq!(l.deposit, U128(3 * NEAR));
+    assert_eq!(c.held_deposits(), 3 * NEAR);
+    assert_eq!(c.get_invariant_parts().held_lessee_deposits, U128(3 * NEAR));
+}
+
+#[test]
+fn old_attack_is_impossible_lessee_gets_back_only_what_it_paid() {
+    let mut c = setup();
+    // The owner can no longer attach NEAR as a deposit: exactly 1 yocto only.
+    for attached in [0, 2, NEAR, 5 * NEAR] {
+        fails(
+            || {
+                testing_env!(ctx("owner.near", attached).build());
+                c.start_lease(acc("lessee.near"), U128(NEAR), 86_400, U128(NEAR));
+            },
+            "Requires attached deposit of exactly 1 yoctoNEAR",
+        );
+    }
+    assert!(c.lease_offer.is_none() && c.lease.is_none());
+
+    lease(&mut c, 2 * NEAR);
+    testing_env!(ctx("lessee.near", 1).build());
+    c.off_hire();
+    assert!(c.lease.is_none());
+    assert_eq!(c.get_pending(acc("lessee.near")).0, 2 * NEAR);
+    assert_eq!(c.get_pending(acc("owner.near")).0, 0);
+    assert_eq!(c.pending_total, 2 * NEAR);
+    testing_env!(ctx("lessee.near", 0).build());
+    let _ = c.withdraw();
+    assert_eq!(c.pending_total, 0);
+    assert_eq!(c.get_pending(acc("lessee.near")).0, 0);
+    assert!(get_logs().iter().any(|l| l.contains("\"event\":\"withdrawn\"") && l.contains(&format!("\"amount\":\"{}\"", 2 * NEAR))));
+    // Nothing more for the lessee to take.
+    fails(
+        || {
+            testing_env!(ctx("lessee.near", 0).build());
+            let _ = c.withdraw();
+        },
+        err::NOTHING_TO_WITHDRAW,
+    );
+}
+
+#[test]
+fn only_named_lessee_can_accept() {
+    let mut c = setup();
+    offer(&mut c, NEAR);
+    for who in ["owner.near", "outsider.near", "inspector.near"] {
+        fails(
+            || {
+                testing_env!(ctx(who, NEAR).build());
+                c.accept_lease();
+            },
+            err::NOT_LESSEE,
+        );
+    }
+    assert!(c.lease.is_none() && c.lease_offer.is_some());
+    testing_env!(ctx("lessee.near", NEAR).build());
+    c.accept_lease();
+    assert!(c.lease.is_some());
+}
+
+#[test]
+fn wrong_deposit_is_rejected() {
+    let mut c = setup();
+    offer(&mut c, NEAR);
+    for attached in [NEAR - 1, NEAR + 1, 0] {
+        fails(
+            || {
+                testing_env!(ctx("lessee.near", attached).build());
+                c.accept_lease();
+            },
+            err::WRONG_DEPOSIT,
+        );
+    }
+    assert!(c.lease.is_none() && c.lease_offer.is_some());
+    testing_env!(ctx("lessee.near", NEAR).build());
+    c.accept_lease();
+    assert_eq!(c.get_lease().unwrap().deposit, U128(NEAR));
+}
+
+#[test]
+fn start_lease_checks() {
+    let mut c = setup();
+    let start = |c: &mut BoxContract, lessee: &str, rate: u128, dur: u64, dep: u128| {
+        testing_env!(ctx("owner.near", 1).build());
+        c.start_lease(acc(lessee), U128(rate), dur, U128(dep));
+    };
+    fails(|| start(&mut c, "lessee.near", NEAR, 86_400, 0), err::ZERO_DEPOSIT);
+    fails(|| start(&mut c, "lessee.near", 0, 86_400, 1), err::ZERO_RATE);
+    fails(|| start(&mut c, "lessee.near", NEAR, 0, 1), err::ZERO_DURATION);
+    fails(|| start(&mut c, "owner.near", NEAR, 86_400, 1), err::LESSEE_IS_OWNER);
+    fails(
+        || {
+            testing_env!(ctx("outsider.near", 1).build());
+            c.start_lease(acc("lessee.near"), U128(NEAR), 86_400, U128(1));
+        },
+        err::NOT_OWNER,
+    );
+    fails(
+        || {
+            testing_env!(ctx_at("owner.near", 1, 20_000).build());
+            c.start_lease(acc("lessee.near"), U128(NEAR), 86_400, U128(1));
+        },
+        err::INSPECTION_LAPSED,
+    );
+    assert!(c.lease_offer.is_none());
+    // Minimum deposit of 1 yocto is accepted.
+    start(&mut c, "lessee.near", NEAR, 86_400, 1);
+    assert_eq!(c.get_lease_offer().unwrap().deposit, U128(1));
+}
+
+#[test]
+fn accept_refused_after_inspection_lapses() {
+    let mut c = setup();
+    offer(&mut c, NEAR);
+    fails(
+        || {
+            testing_env!(ctx_at("lessee.near", NEAR, 20_000).build());
+            c.accept_lease();
+        },
+        err::INSPECTION_LAPSED,
+    );
+    assert!(c.lease.is_none() && c.lease_offer.is_some());
+}
+
+#[test]
+fn cancel_lease_offer_rules() {
+    let mut c = setup();
+    // No offer -> refused.
+    fails(
+        || {
+            testing_env!(ctx("owner.near", 1).build());
+            c.cancel_lease_offer();
+        },
+        err::NO_OFFER,
+    );
+    offer(&mut c, NEAR);
+    // Non-owner (including the lessee) -> refused.
+    for who in ["lessee.near", "outsider.near"] {
+        fails(
+            || {
+                testing_env!(ctx(who, 1).build());
+                c.cancel_lease_offer();
+            },
+            err::NOT_OWNER,
+        );
+    }
+    // Owner without the 1 yocto -> refused.
+    fails(
+        || {
+            testing_env!(ctx("owner.near", 0).build());
+            c.cancel_lease_offer();
+        },
+        "Requires attached deposit of exactly 1 yoctoNEAR",
+    );
+    assert!(c.lease_offer.is_some());
+    testing_env!(ctx("owner.near", 1).build());
+    c.cancel_lease_offer();
+    assert!(c.get_lease_offer().is_none());
+    assert!(get_logs().iter().any(|l| l.contains("\"event\":\"lease_offer_cancelled\"")));
+    // Accept after cancel -> refused.
+    fails(
+        || {
+            testing_env!(ctx("lessee.near", NEAR).build());
+            c.accept_lease();
+        },
+        err::NO_OFFER,
+    );
+    // Cancel after accept -> refused (nothing pending).
+    lease(&mut c, NEAR);
+    fails(
+        || {
+            testing_env!(ctx("owner.near", 1).build());
+            c.cancel_lease_offer();
+        },
+        err::NO_OFFER,
+    );
+    assert!(c.lease.is_some());
+}
+
+#[test]
+fn accept_and_cancel_refused_under_sale_lock() {
+    let mut c = setup();
+    offer(&mut c, NEAR);
+    testing_env!(ctx("owner.near", 1).build());
+    c.list(U128(5 * NEAR));
+    testing_env!(ctx("buyer.near", 5 * NEAR).build());
+    let _ = c.buy();
+    assert!(c.lock.is_some());
+    fails(
+        || {
+            testing_env!(ctx("lessee.near", NEAR).build());
+            c.accept_lease();
+        },
+        err::LOCKED,
+    );
+    fails(
+        || {
+            testing_env!(ctx("owner.near", 1).build());
+            c.cancel_lease_offer();
+        },
+        err::LOCKED,
+    );
+    assert!(c.lease.is_none() && c.lease_offer.is_some());
+}
+
+#[test]
+fn second_offer_and_accept_refused_when_pending_or_active() {
+    let mut c = setup();
+    offer(&mut c, NEAR);
+    // Another offer while one is pending.
+    fails(|| offer(&mut c, 2 * NEAR), err::OFFER_PENDING);
+    assert_eq!(c.get_lease_offer().unwrap().deposit, U128(NEAR));
+    testing_env!(ctx("lessee.near", NEAR).build());
+    c.accept_lease();
+    // A second accept finds no offer.
+    fails(
+        || {
+            testing_env!(ctx("lessee.near", NEAR).build());
+            c.accept_lease();
+        },
+        err::NO_OFFER,
+    );
+    // A new offer while a lease is active.
+    fails(|| offer(&mut c, NEAR), err::LEASE_ACTIVE);
+    // Defensive: an offer present next to an active lease cannot be accepted.
+    let active = c.lease.clone();
+    c.lease_offer = Some(LeaseOffer {
+        lessee: acc("lessee.near"),
+        rate_per_day: U128(NEAR),
+        duration_secs: 86_400,
+        deposit: U128(NEAR),
+        offered_by: acc("owner.near"),
+    });
+    fails(
+        || {
+            testing_env!(ctx("lessee.near", NEAR).build());
+            c.accept_lease();
+        },
+        err::LEASE_ACTIVE,
+    );
+    assert_eq!(c.lease, active);
+}
+
+#[test]
+fn stale_offer_after_ownership_change_is_refused() {
+    let mut c = setup();
+    offer(&mut c, NEAR);
+    testing_env!(ctx("owner.near", 1).build());
+    c.list(U128(5 * NEAR));
+    testing_env!(ctx("buyer.near", 5 * NEAR).build());
+    let _ = c.buy();
+    callback_ctx(PromiseResult::Successful(vec![]));
+    assert_eq!(c.on_nft_transfer(1), "finalized");
+    assert_eq!(c.owner, acc("buyer.near"));
+    fails(
+        || {
+            testing_env!(ctx("lessee.near", NEAR).build());
+            c.accept_lease();
+        },
+        err::STALE_OFFER,
+    );
+    assert!(c.lease.is_none());
+    // The old owner can no longer cancel; the new owner can, then offer anew.
+    fails(
+        || {
+            testing_env!(ctx("owner.near", 1).build());
+            c.cancel_lease_offer();
+        },
+        err::NOT_OWNER,
+    );
+    testing_env!(ctx("buyer.near", 1).build());
+    c.cancel_lease_offer();
+    c.start_lease(acc("lessee.near"), U128(NEAR), 86_400, U128(NEAR));
+    assert_eq!(c.get_lease_offer().unwrap().offered_by, acc("buyer.near"));
+    testing_env!(ctx("lessee.near", NEAR).build());
+    c.accept_lease();
+    assert_eq!(c.get_lease().unwrap().deposit, U128(NEAR));
+}
+
+#[test]
+fn accept_refused_when_lessee_became_owner() {
+    // The lessee buys the box while its own offer is pending: the offer is
+    // stale, and the owner cannot lease to itself.
+    let mut c = setup();
+    offer(&mut c, NEAR);
+    testing_env!(ctx("owner.near", 1).build());
+    c.list(U128(5 * NEAR));
+    testing_env!(ctx("lessee.near", 5 * NEAR).build());
+    let _ = c.buy();
+    callback_ctx(PromiseResult::Successful(vec![]));
+    assert_eq!(c.on_nft_transfer(1), "finalized");
+    fails(
+        || {
+            testing_env!(ctx("lessee.near", NEAR).build());
+            c.accept_lease();
+        },
+        err::STALE_OFFER,
+    );
 }

@@ -12,7 +12,8 @@ use serde_json::json;
 
 const DAY: u64 = 86_400;
 
-/// Mint + inspector attests + lease, shared by several tests.
+/// Mint + inspector attests + lease (owner offers with 1 yocto, the lessee
+/// accepts and posts `deposit`), shared by several tests.
 async fn leased_box(e: &Env, deposit: u128) -> Result<near_workspaces::AccountId> {
     let b = e.mint(&e.owner, 30 * DAY).await?;
     e.check(&b, "minted").await?;
@@ -20,9 +21,12 @@ async fn leased_box(e: &Env, deposit: u128) -> Result<near_workspaces::AccountId
     e.ok(&e.inspector, &b, "attest_inspection", json!({ "valid_until": now + 60 * DAY }), 0).await?;
     e.check(&b, "inspector attested").await?;
     e.ok(&e.owner, &b, "start_lease",
-        json!({ "lessee": e.lessee.id(), "rate_per_day": (NEAR / 10).to_string(), "duration_secs": 30 * DAY }),
-        deposit).await?;
-    e.check(&b, "lease started").await?;
+        json!({ "lessee": e.lessee.id(), "rate_per_day": (NEAR / 10).to_string(), "duration_secs": 30 * DAY,
+                "deposit": deposit.to_string() }),
+        1).await?;
+    e.check(&b, "lease offered").await?;
+    e.ok(&e.lessee, &b, "accept_lease", json!({}), deposit).await?;
+    e.check(&b, "lessee accepted lease (posted deposit)").await?;
     Ok(b)
 }
 
@@ -265,7 +269,9 @@ async fn t4_stuck_lock() -> Result<()> {
     // While locked: hire and lease/sale changes are refused.
     e.fail(&e.lessee, &b, "pay_hire", json!({}), NEAR, "ERR_SALE_LOCKED").await?;
     e.fail(&e.owner, &b, "cancel_list", json!({}), 1, "ERR_SALE_LOCKED").await?;
-    e.check(&b, "4.1 pay_hire / cancel_list refused while locked").await?;
+    e.fail(&e.lessee, &b, "accept_lease", json!({}), NEAR, "ERR_SALE_LOCKED").await?;
+    e.fail(&e.owner, &b, "cancel_lease_offer", json!({}), 1, "ERR_SALE_LOCKED").await?;
+    e.check(&b, "4.1 pay_hire / cancel_list / accept_lease / cancel_lease_offer refused while locked").await?;
 
     // Rescue before the delay: refused, lock stays.
     ensure!(e.height().await? < started + SALE_UNDO_DELAY_BLOCKS);
@@ -406,10 +412,34 @@ async fn t5_lapsed_inspection() -> Result<()> {
     let valid_until = e.now_secs().await? + 120;
     e.ok(&e.inspector, &b, "attest_inspection", json!({ "valid_until": valid_until }), 0).await?;
     e.check(&b, "inspector attested short validity").await?;
-    e.ok(&e.owner, &b, "start_lease",
-        json!({ "lessee": e.lessee.id(), "rate_per_day": NEAR.to_string(), "duration_secs": 10 * DAY }),
-        NEAR).await?;
-    e.check(&b, "lease started while inspection valid").await?;
+    let offer = json!({ "lessee": e.lessee.id(), "rate_per_day": NEAR.to_string(), "duration_secs": 10 * DAY,
+                        "deposit": NEAR.to_string() });
+    // The old attack: the owner can no longer attach NEAR as the deposit.
+    e.fail(&e.owner, &b, "start_lease", offer.clone(), NEAR, "Requires attached deposit of exactly 1 yoctoNEAR").await?;
+    ensure!(e.bview(&b, "get_lease_offer").await?.is_null() && e.bview(&b, "get_lease").await?.is_null());
+    e.check(&b, "start_lease with owner-attached NEAR refused").await?;
+    e.ok(&e.owner, &b, "start_lease", offer, 1).await?;
+    ensure!(e.bview(&b, "get_lease").await?.is_null(), "offer does not start the lease");
+    ensure!(e.bview(&b, "get_lease_offer").await?["deposit"] == json!(NEAR.to_string()));
+    e.check(&b, "lease offered (owner attached 1 yocto, no deposit held)").await?;
+    // Only the named lessee, with exactly the offered deposit.
+    e.fail(&e.owner, &b, "accept_lease", json!({}), NEAR, "ERR_NOT_LESSEE").await?;
+    e.fail(&e.outsider, &b, "accept_lease", json!({}), NEAR, "ERR_NOT_LESSEE").await?;
+    e.fail(&e.lessee, &b, "accept_lease", json!({}), NEAR - 1, "ERR_WRONG_DEPOSIT").await?;
+    e.fail(&e.lessee, &b, "accept_lease", json!({}), NEAR + 1, "ERR_WRONG_DEPOSIT").await?;
+    e.check(&b, "accept by owner/outsider or with a wrong deposit refused").await?;
+    // The deposit comes from the lessee (it pays the deposit plus gas; unused
+    // prepaid gas may not be refunded yet when the balance is read).
+    let lessee0 = e.balance(e.lessee.id()).await?;
+    e.ok(&e.lessee, &b, "accept_lease", json!({}), NEAR).await?;
+    let lessee1 = e.balance(e.lessee.id()).await?;
+    ensure!(lessee0 >= lessee1 + NEAR && lessee0 < lessee1 + NEAR + NEAR / 5,
+        "lessee paid the deposit ({lessee0} -> {lessee1})");
+    let parts = e.bview(&b, "get_invariant_parts").await?;
+    ensure!(parts["held_lessee_deposits"] == json!(NEAR.to_string()), "box holds the lessee deposit");
+    ensure!(e.bview(&b, "get_lease").await?["deposit"] == json!(NEAR.to_string()));
+    ensure!(e.bview(&b, "get_lease_offer").await?.is_null());
+    e.check(&b, "lessee accepted lease while inspection valid (posted deposit)").await?;
     let mut n = 0;
     while e.now_secs().await? <= valid_until {
         e.worker.fast_forward(200).await?;
@@ -429,11 +459,14 @@ async fn t5_lapsed_inspection() -> Result<()> {
     // 3. After off_hire, start_lease fails.
     e.ok(&e.lessee, &b, "off_hire", json!({}), 1).await?;
     e.check(&b, "lessee off-hired (deposit credited)").await?;
+    ensure!(e.pending(&b, &e.owner).await? == 0, "owner is credited nothing from the deposit");
     let got = e.withdraw(&e.lessee, &b).await?;
-    ensure!(got == NEAR, "deposit returned");
-    e.check(&b, "lessee withdrew deposit").await?;
-    let sl = json!({ "lessee": e.lessee.id(), "rate_per_day": NEAR.to_string(), "duration_secs": DAY });
-    e.fail(&e.owner, &b, "start_lease", sl.clone(), NEAR, "ERR_INSPECTION_LAPSED").await?;
+    ensure!(got == NEAR, "deposit returned to the lessee: exactly what the lessee paid");
+    e.fail(&e.lessee, &b, "withdraw", json!({}), 0, "ERR_NOTHING_TO_WITHDRAW").await?;
+    e.check(&b, "lessee withdrew its own deposit, nothing more").await?;
+    let sl = json!({ "lessee": e.lessee.id(), "rate_per_day": NEAR.to_string(), "duration_secs": DAY,
+                     "deposit": NEAR.to_string() });
+    e.fail(&e.owner, &b, "start_lease", sl.clone(), 1, "ERR_INSPECTION_LAPSED").await?;
     e.check(&b, "start_lease refused: inspection lapsed").await?;
 
     // 4. Owner, buyer, lessee cannot attest.
@@ -446,8 +479,11 @@ async fn t5_lapsed_inspection() -> Result<()> {
     // 5. Inspector attests; start_lease succeeds.
     e.ok(&e.inspector, &b, "attest_inspection", json!({ "valid_until": future }), 0).await?;
     e.check(&b, "inspector re-attested").await?;
-    e.ok(&e.owner, &b, "start_lease", sl, NEAR).await?;
+    e.ok(&e.owner, &b, "start_lease", sl, 1).await?;
     e.check(&b, "start_lease succeeds after re-attestation").await?;
+    e.ok(&e.lessee, &b, "accept_lease", json!({}), NEAR).await?;
+    ensure!(e.bview(&b, "get_lease").await?["lessee"] == json!(e.lessee.id()));
+    e.check(&b, "lessee accepted the new lease").await?;
     Ok(())
 }
 

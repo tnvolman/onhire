@@ -47,11 +47,14 @@ fn keys_dir() -> std::path::PathBuf {
 fn suffix() -> String {
     std::env::var("ONHIRE_SUFFIX").unwrap_or_else(|_| "n12".into())
 }
-/// The fee-enabled collection. `onhire.testnet` (tests 1-6 proof at 7057b06)
-/// keeps the pre-fee code: its state layout and set-once item code cannot
-/// take the fee, so the fee build runs on a fresh sub-account.
+/// The collection for the lessee-deposit build (two-step lease: owner
+/// offers, lessee accepts and posts the deposit). `onhire.testnet` (tests 1-6
+/// proof at 7057b06) keeps the pre-fee code and `v2.onhire.testnet` keeps the
+/// owner-funded-deposit code: boxes are keyless and item code is set once,
+/// so neither can take the new lease flow, and this build runs on a fresh
+/// sub-account. `ONHIRE_COLLECTION` overrides.
 fn collection_id() -> String {
-    std::env::var("ONHIRE_COLLECTION").unwrap_or_else(|_| "v2.onhire.testnet".into())
+    std::env::var("ONHIRE_COLLECTION").unwrap_or_else(|_| "v3.onhire.testnet".into())
 }
 /// Throwaway `.testnet` fee account for the testnet deploy.
 fn fee_account_id() -> Result<AccountId> {
@@ -470,9 +473,12 @@ impl Env {
         self.ok(&self.inspector, &b, "attest_inspection", json!({ "valid_until": now + 60 * DAY }), 0).await?;
         self.check(&b, "inspector attested").await?;
         self.ok(&self.owner, &b, "start_lease",
-            json!({ "lessee": self.lessee.id(), "rate_per_day": (NEAR / 100).to_string(), "duration_secs": 30 * DAY }),
-            deposit).await?;
-        self.check(&b, "lease started").await?;
+            json!({ "lessee": self.lessee.id(), "rate_per_day": (NEAR / 100).to_string(), "duration_secs": 30 * DAY,
+                    "deposit": deposit.to_string() }),
+            1).await?;
+        self.check(&b, "lease offered").await?;
+        self.ok(&self.lessee, &b, "accept_lease", json!({}), deposit).await?;
+        self.check(&b, "lessee accepted lease (posted deposit)").await?;
         Ok(b)
     }
 }
@@ -518,11 +524,12 @@ async fn topup(e: &Env) -> Result<()> {
     Ok(())
 }
 
-/// One time, for the fee build: create the throwaway testnet fee account
-/// (top-level, via the public `testnet` registrar) and the fresh collection
-/// sub-account `v2.onhire.testnet`, then move idle test NEAR from the other
-/// throwaway accounts into the collection for the global code deploy.
-/// Keys go to $ONHIRE_KEYS. Testnet only.
+/// One time, per collection build: create the throwaway testnet fee account
+/// (top-level, via the public `testnet` registrar) if it does not exist yet,
+/// and the fresh collection sub-account (default `v3.onhire.testnet`, see
+/// `collection_id`; `v2.onhire.testnet` was made the same way), then move
+/// idle test NEAR from the other throwaway accounts into the collection for
+/// the global code deploy. Keys go to $ONHIRE_KEYS. Testnet only.
 async fn fee_setup(worker: &Worker<Testnet>) -> Result<()> {
     let mut rec = std::fs::OpenOptions::new().create(true).append(true).open(root().join("logs/testnet-records.jsonl"))?;
     let mut log = |label: &str, signer: &AccountId, receiver: &AccountId, method: &str, r: &ExecutionFinalResult| {
@@ -565,7 +572,7 @@ async fn fee_setup(worker: &Worker<Testnet>) -> Result<()> {
         let free = { let a = worker.view_account(v1.id()).await?; a.balance.as_yoctonear() - a.storage_usage as u128 * STORAGE_BYTE_COST };
         let amt = free.saturating_sub(NEAR / 5);
         let ex = v1.create_subaccount(sub).initial_balance(yocto(amt)).keys(sk).transact().await?;
-        log("create fee-build collection sub-account", v1.id(), &coll_id, "CreateAccount", &ex.details);
+        log(&format!("create collection sub-account {coll_id}"), v1.id(), &coll_id, "CreateAccount", &ex.details);
         ensure!(ex.details.is_success(), "create {coll_id} failed");
     } else {
         println!("[fee-setup] {coll_id} already exists");
@@ -1048,13 +1055,39 @@ async fn t4(e: &Env) -> Result<()> {
 async fn t5(e: &Env) -> Result<()> {
     let b = e.mint(&e.owner, 30 * DAY).await?;
     e.check(&b, "minted").await?;
-    let valid_until = e.now_secs().await? + 45;
+    // 300 s: the attest, the offer and the accept must all land while the
+    // inspection is valid, even if one of them is dropped and resent (the
+    // runner waits 90 s before resending a dropped tx).
+    let valid_until = e.now_secs().await? + 300;
     e.ok(&e.inspector, &b, "attest_inspection", json!({ "valid_until": valid_until }), 0).await?;
-    e.check(&b, "inspector attested short validity (45 s)").await?;
+    e.check(&b, "inspector attested short validity (300 s)").await?;
     e.ok(&e.owner, &b, "start_lease",
-        json!({ "lessee": e.lessee.id(), "rate_per_day": (NEAR / 100).to_string(), "duration_secs": 10 * DAY }),
-        NEAR / 10).await?;
-    e.check(&b, "lease started while inspection valid").await?;
+        json!({ "lessee": e.lessee.id(), "rate_per_day": (NEAR / 100).to_string(), "duration_secs": 10 * DAY,
+                "deposit": (NEAR / 10).to_string() }),
+        1).await?;
+    ensure!(e.bview(&b, "get_lease").await?.is_null(), "offer does not start the lease");
+    e.check(&b, "lease offered (owner attached 1 yocto, no deposit held)").await?;
+    // Only the named lessee, with exactly the offered deposit.
+    e.fail(&e.owner, &b, "accept_lease", json!({}), NEAR / 10, "ERR_NOT_LESSEE").await?;
+    e.fail(&e.outsider, &b, "accept_lease", json!({}), NEAR / 10, "ERR_NOT_LESSEE").await?;
+    e.fail(&e.lessee, &b, "accept_lease", json!({}), NEAR / 10 - 1, "ERR_WRONG_DEPOSIT").await?;
+    e.fail(&e.lessee, &b, "accept_lease", json!({}), NEAR / 10 + 1, "ERR_WRONG_DEPOSIT").await?;
+    ensure!(e.bview(&b, "get_lease").await?.is_null(), "no lease after refused accepts");
+    e.check(&b, "accept by owner/outsider or with a wrong deposit refused").await?;
+    // The deposit comes from the lessee.
+    let lessee0 = e.balance(e.lessee.id()).await?;
+    e.ok(&e.lessee, &b, "accept_lease", json!({}), NEAR / 10).await?;
+    // Unused prepaid gas (150 Tgas) is refunded in a later receipt, so let
+    // it land, then allow up to 0.25 NEAR of gas on top of the deposit. The
+    // exact check is the box-side `held_lessee_deposits` below.
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    let lessee1 = e.balance(e.lessee.id()).await?;
+    println!("[{}]   lessee balance drop on accept: {} NEAR (deposit 0.1 + gas)", e.test_name, fmt_near(lessee0.saturating_sub(lessee1)));
+    ensure!(lessee0 >= lessee1 + NEAR / 10 && lessee0 < lessee1 + NEAR / 10 + NEAR / 4,
+        "lessee paid the deposit ({lessee0} -> {lessee1})");
+    ensure!(e.bview(&b, "get_invariant_parts").await?["held_lessee_deposits"] == json!((NEAR / 10).to_string()),
+        "box holds the lessee deposit");
+    e.check(&b, "lessee accepted lease while inspection valid (posted deposit)").await?;
     // Wait in real time past valid_until, then read get_inspection *pinned to
     // a block height whose timestamp is past valid_until*. An unpinned
     // (optimistic, load-balanced) view can be served by a lagging RPC node
@@ -1062,7 +1095,7 @@ async fn t5(e: &Env) -> Result<()> {
     // The contract is unchanged: valid_now = block_timestamp_secs <= valid_until.
     let started = std::time::Instant::now();
     loop {
-        ensure!(started.elapsed().as_secs() < 300, "no block past valid_until {valid_until} showed valid_now=false within 300 s");
+        ensure!(started.elapsed().as_secs() < 600, "no block past valid_until {valid_until} showed valid_now=false within 600 s");
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         let blk = match e.worker.view_block().await {
             Ok(b) => b,
@@ -1090,11 +1123,16 @@ async fn t5(e: &Env) -> Result<()> {
 
     e.ok(&e.lessee, &b, "off_hire", json!({}), 1).await?;
     e.check(&b, "lessee off-hired (deposit credited)").await?;
+    ensure!(e.pending(&b, &e.owner).await? == 0, "owner is credited nothing from the deposit");
     let got = e.withdraw(&e.lessee, &b).await?;
-    ensure!(got == NEAR / 10, "deposit returned");
-    e.check(&b, "lessee withdrew deposit").await?;
-    let sl = json!({ "lessee": e.lessee.id(), "rate_per_day": (NEAR / 100).to_string(), "duration_secs": DAY });
-    e.fail(&e.owner, &b, "start_lease", sl.clone(), NEAR / 10, "ERR_INSPECTION_LAPSED").await?;
+    ensure!(got == NEAR / 10, "deposit returned to the lessee: exactly what the lessee paid");
+    e.check(&b, "lessee withdrew its own deposit").await?;
+    let sl = json!({ "lessee": e.lessee.id(), "rate_per_day": (NEAR / 100).to_string(), "duration_secs": DAY,
+                     "deposit": (NEAR / 10).to_string() });
+    // The old attack: the owner can no longer attach NEAR as the deposit.
+    e.fail(&e.owner, &b, "start_lease", sl.clone(), NEAR / 10, "Requires attached deposit of exactly 1 yoctoNEAR").await?;
+    e.check(&b, "start_lease with owner-attached NEAR refused").await?;
+    e.fail(&e.owner, &b, "start_lease", sl.clone(), 1, "ERR_INSPECTION_LAPSED").await?;
     e.check(&b, "start_lease refused: inspection lapsed").await?;
 
     let future = e.now_secs().await? + 30 * DAY;
@@ -1105,8 +1143,10 @@ async fn t5(e: &Env) -> Result<()> {
 
     e.ok(&e.inspector, &b, "attest_inspection", json!({ "valid_until": future }), 0).await?;
     e.check(&b, "inspector re-attested").await?;
-    e.ok(&e.owner, &b, "start_lease", sl, NEAR / 10).await?;
+    e.ok(&e.owner, &b, "start_lease", sl, 1).await?;
     e.check(&b, "start_lease succeeds after re-attestation").await?;
+    e.ok(&e.lessee, &b, "accept_lease", json!({}), NEAR / 10).await?;
+    e.check(&b, "lessee accepted the new lease").await?;
     Ok(())
 }
 

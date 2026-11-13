@@ -74,7 +74,11 @@ pub mod err {
     pub const RESERVE_BELOW_MIN: &str = "ERR_RESERVE_BELOW_MIN";
     pub const ZERO_RATE: &str = "ERR_ZERO_RATE";
     pub const ZERO_DURATION: &str = "ERR_ZERO_DURATION";
-    pub const DEPOSIT_REQUIRED: &str = "ERR_ATTACH_AT_LEAST_1_YOCTO";
+    pub const ZERO_DEPOSIT: &str = "ERR_ZERO_DEPOSIT";
+    pub const WRONG_DEPOSIT: &str = "ERR_WRONG_DEPOSIT";
+    pub const OFFER_PENDING: &str = "ERR_LEASE_OFFER_PENDING";
+    pub const NO_OFFER: &str = "ERR_NO_LEASE_OFFER";
+    pub const STALE_OFFER: &str = "ERR_STALE_OFFER";
     pub const LESSEE_IS_OWNER: &str = "ERR_LESSEE_IS_OWNER";
     pub const NOT_LESSEE: &str = "ERR_NOT_LESSEE";
     pub const ZERO_HIRE: &str = "ERR_ZERO_HIRE";
@@ -119,6 +123,22 @@ pub struct Lease {
     pub deposit: U128,
 }
 
+/// A lease the owner has offered and the named lessee has not yet accepted.
+/// It holds no funds and does not start the clock.
+#[near(serializers = [borsh, json])]
+#[derive(Clone, Debug, PartialEq)]
+pub struct LeaseOffer {
+    pub lessee: AccountId,
+    /// yoctoNEAR per day, paid explicitly via `pay_hire`.
+    pub rate_per_day: U128,
+    /// Lease length, counted from acceptance.
+    pub duration_secs: u64,
+    /// Exact NEAR the lessee must attach to `accept_lease`.
+    pub deposit: U128,
+    /// Box owner who made the offer. If ownership changes, the offer is stale.
+    pub offered_by: AccountId,
+}
+
 #[near]
 #[derive(BorshStorageKey)]
 pub enum StorageKey {
@@ -159,6 +179,8 @@ pub struct BoxContract {
     pub fee_bps: u16,
     /// Running total of protocol fees sent to `fee_account`.
     pub fees_paid: u128,
+    /// Pending (unaccepted) lease offer, if any.
+    pub lease_offer: Option<LeaseOffer>,
 }
 
 /// Split of one hire payment (spec 2.1 + protocol fee).
@@ -283,6 +305,7 @@ impl BoxContract {
             fee_account,
             fee_bps: FEE_BPS,
             fees_paid: 0,
+            lease_offer: None,
         }
     }
 
@@ -452,30 +475,88 @@ impl BoxContract {
 
     // ---------------------------------------------------------------- lease
 
-    /// 5.4 — owner starts a lease. Attached NEAR (at least 1 yocto) is held as
-    /// the lessee deposit and doubles as the confirmation.
+    /// 5.4 — step 1 of 2: the owner offers a lease to `lessee`. 1 yocto
+    /// confirmation only; the owner posts no deposit. The offer records the
+    /// terms and the exact `deposit` the lessee must attach to
+    /// `accept_lease`. It holds no funds and does not start the clock.
+    /// Refused while a sale is locked, a lease is active or another offer is
+    /// pending.
     #[payable]
-    pub fn start_lease(&mut self, lessee: AccountId, rate_per_day: U128, duration_secs: u64) {
+    pub fn start_lease(
+        &mut self,
+        lessee: AccountId,
+        rate_per_day: U128,
+        duration_secs: u64,
+        deposit: U128,
+    ) {
+        near_sdk::assert_one_yocto();
         self.assert_owner();
         self.assert_unlocked();
-        let deposit = env::attached_deposit().as_yoctonear();
-        require!(deposit >= 1, err::DEPOSIT_REQUIRED);
         require!(self.lease.is_none(), err::LEASE_ACTIVE);
-        let now = now_secs();
-        require!(now <= self.inspection_valid_until, err::INSPECTION_LAPSED);
+        require!(self.lease_offer.is_none(), err::OFFER_PENDING);
+        require!(now_secs() <= self.inspection_valid_until, err::INSPECTION_LAPSED);
         require!(self.reserve >= self.min_reserve, err::RESERVE_BELOW_MIN);
         require!(rate_per_day.0 > 0, err::ZERO_RATE);
         require!(duration_secs > 0, err::ZERO_DURATION);
+        require!(deposit.0 >= 1, err::ZERO_DEPOSIT);
         require!(lessee != self.owner, err::LESSEE_IS_OWNER);
-        let lease = Lease {
+        let offer = LeaseOffer {
             lessee,
             rate_per_day,
+            duration_secs,
+            deposit,
+            offered_by: self.owner.clone(),
+        };
+        emit("lease_offered", near_sdk::serde_json::json!(offer));
+        self.lease_offer = Some(offer);
+        self.assert_solvent();
+    }
+
+    /// 5.4 — step 2 of 2: the named lessee accepts the pending offer by
+    /// attaching exactly the offered deposit. The lease starts now and runs
+    /// `duration_secs`; the attached NEAR is held as `lease.deposit` and is
+    /// returned to the lessee by `off_hire`. Refused while a sale is locked,
+    /// if a lease is active, if the box owner changed since the offer
+    /// (stale), if the inspection has lapsed or the reserve is below the
+    /// minimum. Any refusal panics, so the attachment is refunded.
+    #[payable]
+    pub fn accept_lease(&mut self) {
+        self.assert_unlocked();
+        let offer = self.lease_offer.clone().unwrap_or_else(|| env::panic_str(err::NO_OFFER));
+        let who = env::predecessor_account_id();
+        require!(who == offer.lessee, err::NOT_LESSEE);
+        require!(self.lease.is_none(), err::LEASE_ACTIVE);
+        require!(offer.offered_by == self.owner, err::STALE_OFFER);
+        require!(who != self.owner, err::LESSEE_IS_OWNER);
+        let now = now_secs();
+        require!(now <= self.inspection_valid_until, err::INSPECTION_LAPSED);
+        require!(self.reserve >= self.min_reserve, err::RESERVE_BELOW_MIN);
+        let attached = env::attached_deposit().as_yoctonear();
+        require!(attached == offer.deposit.0, err::WRONG_DEPOSIT);
+        self.lease_offer = None;
+        let lease = Lease {
+            lessee: who,
+            rate_per_day: offer.rate_per_day,
             start_ts: now,
-            end_ts: now.saturating_add(duration_secs),
-            deposit: U128(deposit),
+            end_ts: now.saturating_add(offer.duration_secs),
+            deposit: U128(attached),
         };
         emit("lease_started", near_sdk::serde_json::json!(lease));
         self.lease = Some(lease);
+        self.assert_solvent();
+    }
+
+    /// 5.4 — the owner withdraws a pending, unaccepted offer. 1 yocto
+    /// confirmation. Like the other owner methods it is refused while a sale
+    /// is locked (accept is refused then too, so nothing can change under
+    /// the lock). A new owner may cancel a stale offer left by the seller.
+    #[payable]
+    pub fn cancel_lease_offer(&mut self) {
+        near_sdk::assert_one_yocto();
+        self.assert_owner();
+        self.assert_unlocked();
+        let offer = self.lease_offer.take().unwrap_or_else(|| env::panic_str(err::NO_OFFER));
+        emit("lease_offer_cancelled", near_sdk::serde_json::json!(offer));
         self.assert_solvent();
     }
 
@@ -509,8 +590,9 @@ impl BoxContract {
     }
 
     /// 5.4 — end the lease: the lessee at any time, or the owner after the
-    /// lease end. The full deposit is credited to the lessee as a pull
-    /// balance (no damage model in this version). 1 yocto confirmation.
+    /// lease end. The full deposit (which the lessee posted in
+    /// `accept_lease`) is credited back to the lessee as a pull balance (no
+    /// damage model in this version). 1 yocto confirmation.
     #[payable]
     pub fn off_hire(&mut self) {
         near_sdk::assert_one_yocto();
@@ -560,6 +642,10 @@ impl BoxContract {
     }
     pub fn get_lease(&self) -> Option<Lease> {
         self.lease.clone()
+    }
+    /// The pending, unaccepted lease offer, if any.
+    pub fn get_lease_offer(&self) -> Option<LeaseOffer> {
+        self.lease_offer.clone()
     }
     pub fn get_inspection(&self) -> InspectionView {
         InspectionView {

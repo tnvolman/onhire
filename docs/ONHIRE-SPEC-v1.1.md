@@ -1,6 +1,6 @@
 # Onhire — Technical Specification v1.1
 
-**Status:** v1.1, frozen 2026-11-11, with the 1% protocol fee added 2026-11-12.
+**Status:** v1.1, frozen 2026-11-11, with the 1% protocol fee added 2026-11-12 and the two-step lease (owner offers, named lessee accepts and posts the deposit) added 2026-11-13. The two-step lease replaces the earlier owner-funded deposit, which let the named lessee end the lease at once and withdraw the owner's NEAR.
 
 **Author / copyright:** see `LICENSE`. License: proprietary, all rights reserved, with a limited NEAR HACKATHON evaluation grant.
 
@@ -14,7 +14,7 @@
 
 ## 1. What this is
 
-Onhire is a testnet prototype of container leasing. Each shipping container is an NFT that is also its own NEAR account. A lessee makes lease payments into the box. A cut of every lease payment is locked in a repair reserve the owner can never withdraw. The box refuses a new lease when its inspection has lapsed. A separate inspector attests inspections; the owner cannot attest their own box. The owner can list the box for a price, and a buyer can purchase it mid-lease. The lease, the reserve, and future lease payments move with the box. Already-earned lease payments and the sale price are credited to the seller as a pull balance. Nobody can take what is not theirs.
+Onhire is a testnet prototype of container leasing. Each shipping container is an NFT that is also its own NEAR account. A lessee makes lease payments into the box. A cut of every lease payment is locked in a repair reserve the owner can never withdraw. The box refuses a new lease when its inspection has lapsed. A separate inspector attests inspections; the owner cannot attest their own box. The owner can list the box for a price, and a buyer can purchase it mid-lease. The lease, the reserve, and future lease payments move with the box. Already-earned lease payments and the sale price are credited to the seller as a pull balance. Each payout goes only to the account it is owed to, and the tests check this.
 
 The demo opens on the mid-lease sale, then a payment that goes to the new owner, a refused lease after inspection lapses, and (stretch) a depot paid from the reserve.
 
@@ -32,7 +32,7 @@ The demo opens on the mid-lease sale, then a payment that goes to the new owner,
 8. Every collection transfer path is gated to the box account for that token: `nft_transfer`, `nft_transfer_call`, and all approval paths (`nft_approve`, `nft_revoke`, `nft_revoke_all`, and any transfer-by-approved-account). A direct owner or marketplace call must fail. There is no marketplace in this version.
 9. A lease payment belongs to whoever the box records as owner at the moment `pay_hire` succeeds. No proration.
 10. `pay_hire` during a sale lock is rejected. The lessee retries after the sale finalizes or is undone. After a successful sale, the next payment goes to the buyer. After an undone sale, it goes to the original owner.
-11. A lapsed inspection blocks `start_lease` only. An active lease continues.
+11. A lapsed inspection blocks starting a lease only (`start_lease` and `accept_lease`). An active lease continues.
 12. The owner can never withdraw the reserve. There is no owner-facing reserve withdrawal method.
 13. The owner can never attest their own box. Only the inspector account can attest. The inspector is set at mint or on the collection and is not changeable by the owner.
 14. After every test step, this invariant holds: `box_native_balance >= storage_staking + reserve + sum(pending_withdrawals) + held_lessee_deposits + locked_buyer_payments`.
@@ -43,7 +43,7 @@ The demo opens on the mid-lease sale, then a payment that goes to the new owner,
 | --- | --- | --- |
 | `RESERVE_BPS` | `1500` | 15% of each lease payment goes to the reserve |
 | `SALE_UNDO_DELAY_BLOCKS` | `32` | Undo is allowed only at `lock.started_at_block + 32` or later. Re-measure on testnet day one; if receipts can land later than this, raise it and update the README. Do not lower it to make a test pass. |
-| `MIN_RESERVE` | `0` | `start_lease` also fails when `reserve < MIN_RESERVE`. Zero keeps first-lease tests unblocked. |
+| `MIN_RESERVE` | `0` | `start_lease` and `accept_lease` also fail when `reserve < MIN_RESERVE`. Zero keeps first-lease tests unblocked. |
 | `BPS_DENOMINATOR` | `10_000` | |
 | `FEE_BPS` | `100` | Added 2026-11-12 (author). 1% protocol fee on each lease payment and each sale. Taken from the owner's/seller's proceeds after the reserve split, never from the reserve: lease payment 100 → reserve 15, fee 1, owner 84; sale 100 → fee 1, seller 99. If the owner's share cannot cover the fee, the whole call reverts. Sent to the box's immutable `fee_account` (a throwaway `.testnet` account on the testnet deploy). Proof: `docs/FEE-PROOF.md`. |
 
@@ -128,7 +128,14 @@ lease: Option<{
   rate_per_day: u128,             // yoctoNEAR per day, paid explicitly via pay_hire
   start_block_or_ts: u64,
   end_block_or_ts: u64,
-  deposit: u128
+  deposit: u128                   // posted by the lessee in accept_lease
+}>
+lease_offer: Option<{             // pending, unaccepted offer; holds no NEAR
+  lessee: AccountId,
+  rate_per_day: u128,
+  duration_secs: u64,             // counted from acceptance
+  deposit: u128,                  // exact NEAR the lessee must attach to accept_lease
+  offered_by: AccountId           // owner who made the offer; offer is stale if the owner changes
 }>
 inspection_valid_until: u64       // timestamp, seconds
 inspector: AccountId              // immutable after init
@@ -142,7 +149,7 @@ Storage staking is reserved from the box balance and counts in the invariant. In
 
 ## 5. Methods
 
-Use clear, typed errors. 1-yocto confirmation on owner-only calls that change sale or lease terms, consistent with NEAR NFT practice, unless a given method cannot accept 1 yocto because it already requires a precise attached amount (`buy`, `pay_hire`, deposit-bearing `start_lease`). In those cases, the attached-amount check is the confirmation.
+Use clear, typed errors. 1-yocto confirmation on owner-only calls that change sale or lease terms, consistent with NEAR NFT practice, unless a given method cannot accept 1 yocto because it already requires a precise attached amount (`buy`, `pay_hire`, and the lessee's `accept_lease`, which attaches exactly the offered deposit). In those cases, the attached-amount check is the confirmation. `start_lease` and `cancel_lease_offer` are owner calls and take exactly 1 yocto; the owner never attaches a deposit.
 
 ### 5.1 Box — owner
 
@@ -160,9 +167,13 @@ Use clear, typed errors. 1-yocto confirmation on owner-only calls that change sa
 
 ### 5.4 Box — lessee / owner (lease)
 
-- `start_lease(lessee: AccountId, rate_per_day: U128, duration_secs: u64)` — owner, not locked, no active lease, `now <= inspection_valid_until`, `reserve >= min_reserve`, `rate_per_day > 0`, `duration_secs > 0`. May accept a deposit as attached NEAR, stored in `lease.deposit`.
+A lease starts in two steps. The owner offers; only the named lessee can accept, and the lessee posts the deposit.
+
+- `start_lease(lessee: AccountId, rate_per_day: U128, duration_secs: u64, deposit: U128)` — owner, exactly 1 yocto attached (any other amount fails), not locked, no active lease, no pending offer (`ERR_LEASE_OFFER_PENDING`), `now <= inspection_valid_until`, `reserve >= min_reserve`, `rate_per_day > 0`, `duration_secs > 0`, `deposit >= 1` (`ERR_ZERO_DEPOSIT`), `lessee != owner`. Writes `lease_offer` (terms, required deposit, `offered_by = owner`). Does not start the clock and holds no NEAR. Event `lease_offered`.
+- `accept_lease()` — payable. Not locked; an offer exists (`ERR_NO_LEASE_OFFER`); predecessor == `lease_offer.lessee` (`ERR_NOT_LESSEE`); no active lease; `lease_offer.offered_by == owner`, i.e. the box has not changed hands since the offer (`ERR_STALE_OFFER`); lessee != current owner; inspection still valid and `reserve >= min_reserve`, rechecked now; attached NEAR == `lease_offer.deposit` exactly (`ERR_WRONG_DEPOSIT`). Clears the offer and sets `lease = { lessee, rate_per_day, start = now, end = now + duration_secs, deposit = attached }`, so the clock starts at acceptance. The deposit counts in `held_lessee_deposits` (rule 14). Event `lease_started`. Any refusal panics, so the attached NEAR is refunded.
+- `cancel_lease_offer()` — owner, exactly 1 yocto, not locked, an offer is pending (`ERR_NO_LEASE_OFFER`). Clears the offer. Event `lease_offer_cancelled`. After a sale, the new owner can cancel a stale offer left by the seller.
 - `pay_hire()` — predecessor == current lessee, a lease is active, not locked. Attached NEAR must be `> 0`. Split: `reserve += attached * reserve_bps / 10_000`; remainder added to `accrued_hire` (it belongs to the current box `owner`). No proration. If locked: fail, no split, attached NEAR reverts.
-- `off_hire()` — lessee, or owner after `now > lease.end` (default). Not locked. Return `deposit` minus a documented damage field if you implement damage in this version; if damage is not in the first cut, return the full deposit to the lessee and set `lease = None`. Do not block the six tests on a rich damage model.
+- `off_hire()` — lessee, or owner after `now > lease.end` (default). Not locked. 1 yocto. Return `deposit` (posted by the lessee in `accept_lease`) minus a documented damage field if you implement damage in this version; if damage is not in the first cut, return the full deposit to the lessee and set `lease = None`. Do not block the six tests on a rich damage model.
 
 ### 5.5 Box — inspector
 
@@ -170,7 +181,7 @@ Use clear, typed errors. 1-yocto confirmation on owner-only calls that change sa
 
 ### 5.6 Box — views
 
-- `get_owner`, `get_listing`, `get_lock`, `get_lease`, `get_inspection`, `get_reserve`, `get_accrued_hire`, `get_pending(account)`, `get_invariant_parts` (balance, storage, reserve, pending sum, deposits, locked payments).
+- `get_owner`, `get_listing`, `get_lock`, `get_lease`, `get_lease_offer`, `get_inspection`, `get_reserve`, `get_accrued_hire`, `get_pending(account)`, `get_invariant_parts` (balance, storage, reserve, pending sum, deposits, locked payments).
 - No `withdraw_reserve`. No `add_key`. No `update` / `deploy`. No `delete_account`.
 
 ### 5.7 Collection
@@ -189,7 +200,7 @@ Run in this order: sandbox (near-workspaces), then the same six on testnet. Use 
 
 ### Test 1 — Mid-lease sale
 
-1. Mint a box to Owner. Inspector attests a future `valid_until`. Owner starts a lease with Lessee.
+1. Mint a box to Owner. Inspector attests a future `valid_until`. Owner offers a lease to Lessee (`start_lease`, 1 yocto) and Lessee accepts it, posting the deposit (`accept_lease`).
 2. Lessee makes a lease payment. Reserve increases by 15%; remainder is accrued to Owner.
 3. Owner lists a price. Buyer calls `buy` with that exact amount.
 4. Sale finalizes (callback or, if you must, a legal finalize path).
@@ -216,7 +227,7 @@ Using sandbox state patching (do not rely on a real out-of-gas in CI as the only
 
 ### Test 5 — Lapsed inspection
 
-1. Inspector attests a short `valid_until`. Owner starts a lease (still valid). Fast-forward past `valid_until`.
+1. Inspector attests a short `valid_until`. Owner offers a lease and Lessee accepts it, posting the deposit (still valid). An owner attaching NEAR to `start_lease` is refused; accepts by anyone but the named lessee, or with the wrong deposit, are refused. Fast-forward past `valid_until`.
 2. The active lease still works: `pay_hire` succeeds.
 3. After the lease ends (or after `off_hire`), `start_lease` fails because inspection has lapsed.
 4. Owner's `attest_inspection` fails. Buyer's and lessee's attest calls fail.
@@ -244,6 +255,8 @@ The six tests passing in sandbox, then the same six passing on testnet, with log
 | Rescue undoes while transfer is still in flight, then transfer lands, buyer has the box and a refund | Undo only after `SALE_UNDO_DELAY_BLOCKS`; sale_id makes late callbacks no-ops; finalize if collection already shows buyer. Test 4. |
 | Late callback after undo or after a new sale | Stale `sale_id` is a no-op. Test 4. |
 | A lease payment arrives mid-sale and is credited to the wrong person | `pay_hire` rejected while locked. After finalize, the next lease payment goes to the buyer; after undo, to original owner. |
+| Named lessee ends the lease at once and withdraws a deposit the owner posted | The owner cannot post a deposit (`start_lease` takes exactly 1 yocto); only the lessee posts it, in `accept_lease`, and `off_hire` returns that same amount to the lessee. Unit tests; test 5. |
+| A lease is recorded against an account that never agreed to it | A lease exists only after the named lessee calls `accept_lease`. Unit tests; test 5. |
 | Owner attests their own inspection | Only inspector can attest. Test 5. |
 | Owner withdraws the reserve | No such path. Test 6. |
 | Anyone with a key drains the box or swaps code | No keys on box accounts; no upgrade or delete path. Asserted in every test. |

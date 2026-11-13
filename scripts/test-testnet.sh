@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Run the seven tests (t1..t7) against the contracts already deployed on
-# NEAR *testnet* (collection $ONHIRE_COLLECTION, default v2.onhire.testnet,
-# the fee build; item code as a NEP-591 global
+# NEAR *testnet* (collection $ONHIRE_COLLECTION, default v3.onhire.testnet,
+# the two-step-lease build; item code as a NEP-591 global
 # contract), in order t1..t7 by default, with invariant + zero-key checks after every
 # step. Every tx hash is appended to logs/testnet-records.jsonl.
 # Prereqs: scripts/testnet/create-accounts.sh <suffix>, onhire-testnet fee-setup, then

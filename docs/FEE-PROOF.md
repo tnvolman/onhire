@@ -1,5 +1,79 @@
 # Onhire — 1% protocol fee proof (sandbox + NEAR testnet)
 
+## Current: lease-fix build on `v3.onhire.testnet` (2026-11-13)
+
+Run Friday 2026-11-13, 15:52–16:24 ET (US Eastern). **NEAR testnet only.**
+No mainnet, no real funds. All accounts are throwaways funded from the
+public testnet faucet.
+
+This deployment carries the two-step lease fix: the owner offers with
+1 yocto, and the named lessee accepts and posts the deposit. The fee
+logic is unchanged: `FEE_BPS = 100`, taken after the 15% reserve split, out
+of the owner's or seller's share. Full deployment, accounts, commands and
+the complete tx list are in `docs/TESTNET-PROOF.md` (section "Current").
+
+| | |
+| --- | --- |
+| Collection | `v3.onhire.testnet` |
+| Fee recipient (throwaway) | [`onhire-fee-n13.testnet`](https://testnet.nearblocks.io/address/onhire-fee-n13.testnet), created via the `testnet` registrar [8LHTLurG…](https://testnet.nearblocks.io/txns/8LHTLurGFyRofxyj4JjbeefWKpNwmai97tfzodZJeRfh) |
+| `new(minter, fee_account)` | [37fiicAe…](https://testnet.nearblocks.io/txns/37fiicAessmHVepmD2AxKkufzGWSeYcqzS77sxybUNLT) |
+| Item code (global, NEP-591) | sha256 `5e726984173c57c5d04f3c1e72624c94f6fdd235872e28063d769ce9301f9671`, `set_item_code` [HrMNaVk1…](https://testnet.nearblocks.io/txns/HrMNaVk1gSx8v17qZwiXeLci77hTdMSg5rxeMt8mmgR5) |
+| Collection code | sha256 `e1036df87063267aea6d1daf0e9ccdbf9511911e2e240e6036d76dd4f64d2fe7` |
+| Sandbox for the same wasm | 27 unit tests, 7 sandbox tests passed (`docs/SANDBOX-PROOF.md`) |
+
+### t7 on testnet (pid 884475, `box-0008.v3.onhire.testnet`): PASS, 9 steps, 29 s
+
+| Step | Check | Tx |
+| --- | --- | --- |
+| Lease | owner offer (1 yocto), lessee accept (0.1 NEAR deposit) | [58nEHVfY…](https://testnet.nearblocks.io/txns/58nEHVfYrdTkeQ1x5yniSTFs6xmMXfiagu8gB5G1GLqc), [FJ68gXLh…](https://testnet.nearblocks.io/txns/FJ68gXLh7N6aYceGDEXfnih2ofgVMKqjy6BKZL53W735) |
+| Constants | `get_constants`: `FEE_BPS` 100, `RESERVE_BPS` 1500, `SALE_UNDO_DELAY_BLOCKS` 32, `FEE_ACCOUNT` `onhire-fee-n13.testnet` | — |
+| `pay_hire` 100 yocto | reserve +15, fee account +1 yocto (exact), owner accrues 84 | [3EPGFHx4…](https://testnet.nearblocks.io/txns/3EPGFHx4EMLc4FBg2xeWvcHpmLdu3QraAXYCgFRSqKHp) |
+| `list` + `buy` at 100 yocto | fee account +1 yocto (exact), seller credited 99, reserve unchanged; callback at lock + 2 blocks, finalized | [8cAc69VR…](https://testnet.nearblocks.io/txns/8cAc69VRnEyRtz2crt79mVEdpkZ62CodauGZiFWYPHsc), [CsKkfgd2…](https://testnet.nearblocks.io/txns/CsKkfgd2caANfbLy6AEEQs7Tgt1QZtpUCuzgA928rrMr) |
+| Seller `withdraw` | exactly 99 + 84 yocto | [AtJU5Yk3…](https://testnet.nearblocks.io/txns/AtJU5Yk3dzp6US9M6q9CatHzp44BmP4YFBQvaSsh7C1p) |
+
+Log lines:
+
+```
+[testnet-t7]   FEE OK [hire 100 yocto -> reserve 15 / fee 1 / owner 84]: onhire-fee-n13.testnet received exactly 1 yocto (0.000000 NEAR)
+[testnet-t7]   FEE OK [sale 100 yocto -> fee 1 / seller 99]: onhire-fee-n13.testnet received exactly 1 yocto (0.000000 NEAR)
+[testnet-t7] RESULT: PASS (9 checked steps, 29 s)
+```
+
+### Fee checks in the other tests (exact fee-account deltas)
+
+| Test | Fee checks |
+| --- | --- |
+| t1 (PASS, 14 steps) | hire 0.1 → 0.001; sale 1 → 0.01; hire 0.2 → 0.002 NEAR |
+| t2 (PASS, 11 steps) | undone sale → 0; retry sale 0.5 → 0.005 NEAR |
+| t3 (PASS, 16 steps) | blocked transfers pay no fee (`get_fees_paid` 0) |
+| t4 (PASS, 21 steps) | undone sale → 0; four sales 0.5 → 0.005 NEAR each, each charged once; hire 0.1 → 0.001 NEAR |
+| t5 (PASS, 15 steps) | hire after the inspection lapsed 0.1 → 0.001 NEAR |
+| t6 (PASS, 8 steps) | hire X = 123456789012345678901234 yocto → exactly 1234567890123456789012 yocto |
+
+The table lists the runner's per-payment fee assertions. The box counters
+also include one 0.1 NEAR hire payment each in t2 and t4 (0.001 NEAR fee)
+that those tests make before their sales without a separate fee-account
+check. So `get_fees_paid` is 0.006 NEAR on `box-0002` and 0.022 NEAR on
+`box-0005`.
+
+The fee account was created with 0.1 NEAR and never signs anything. Over
+the whole run, including the failed and earlier passing t5 attempts
+(`box-0006`, `box-0009` to `box-0011`), it gained exactly
+**44,234,567,890,123,456,789,014 yocto**. That equals the sum of
+`get_fees_paid` over all twelve v3 boxes, to the yocto. Every checked step
+printed `INVARIANT OK, ZERO KEYS`.
+
+Not shown on testnet: the fail-closed revert (`ERR_FEE_EXCEEDS_OWNER_SHARE`)
+needs state patching. It is proven in unit tests and sandbox t7.
+
+---
+
+## Earlier proof: fee-only build on `v2.onhire.testnet` (2026-11-12)
+
+This section is kept as a historical record. `v2.onhire.testnet` boxes run the
+earlier lease code, in which the owner posted the deposit.
+
+
 Commit IDs in this document refer to earlier development history, which is kept private. Fee commits: `ae2e0c4` (contracts + sandbox),
 `a6fd509` (testnet runner), `7665554` (README/spec). The runner fixes for the
 t4/t5 retries are in the commit that adds this file. Run date: 2026-11-12
@@ -8,7 +82,7 @@ t4/t5 retries are in the commit that adds this file. Run date: 2026-11-12
 **NEAR testnet only.** No mainnet, no real funds. Every testnet account below
 is a throwaway funded from the public testnet faucet.
 
-## Summary
+### Summary
 
 | Test | Sandbox (global code) | Sandbox (local deploy) | Testnet first run | Testnet retry |
 | --- | --- | --- | --- | --- |
@@ -29,7 +103,7 @@ Testnet t1–t3 and t6–t7 come from the first run. Testnet t4 and t5 come from
 the retry run. The retry ran the same deployed contracts; only the
 test-runner binary changed.
 
-## The fee
+### The fee
 
 - `FEE_BPS = 100` (1%), `BPS_DENOMINATOR = 10000`, `RESERVE_BPS = 1500` (15%).
 - **Lease payment** `P`: reserve `15%` (unchanged), fee `1%` sent to the fee
@@ -47,7 +121,7 @@ test-runner binary changed.
   `get_constants`. On testnet, the largest gap seen between a sale's lock and
   its callback was **2 blocks** in both runs.
 
-### Fee account
+#### Fee account
 
 | | Account |
 | --- | --- |
@@ -61,7 +135,7 @@ mainnet. Nobody else sends to the fee
 account, so the runner checks that its balance grew by **exactly** the
 expected yocto after every lease payment and sale.
 
-## Sandbox (near-workspaces)
+### Sandbox (near-workspaces)
 
 Run before the testnet deploy, on the contracts committed in `ae2e0c4`. The
 contracts and `tests/tests/sandbox.rs` have not changed since then, so
@@ -85,9 +159,9 @@ Each mode built both contracts, then ran:
 - Sandbox `t1_mid_lease_sale` … `t7_protocol_fee`: **7 passed, 0 failed** in
   each mode (93.1 s global, 88.2 s local).
 
-## Testnet
+### Testnet
 
-### Wasm (sha256)
+#### Wasm (sha256)
 
 | Contract | sha256 (hex) | Deployed on testnet |
 | --- | --- | --- |
@@ -98,7 +172,7 @@ Both hashes were rechecked against the chain on 2026-11-12 after the retry.
 Builds: `cargo near build non-reproducible-wasm --no-abi`. The binaries are
 not reproducible across machines.
 
-### Accounts (all throwaway, testnet)
+#### Accounts (all throwaway, testnet)
 
 | Role | Account |
 | --- | --- |
@@ -111,7 +185,7 @@ not reproducible across machines.
 
 Keys live in `~/.onhire-testnet` (mode 700, outside the repo).
 
-### Setup and deploy (once, before the first run)
+#### Setup and deploy (once, before the first run)
 
 | Step | Tx |
 | --- | --- |
@@ -123,7 +197,7 @@ Keys live in `~/.onhire-testnet` (mode 700, outside the repo).
 | `new(minter, fee_account = onhire-fee-n12.testnet)` | [B6LHVi9W…](https://testnet.nearblocks.io/txns/B6LHVi9WyiVf6MJ3y3cv64Q3kYa1cqZa5a6PaAcZDFH6) |
 | `set_item_code(global = true)` (17.88 test NEAR) | [AZNM8AtT…](https://testnet.nearblocks.io/txns/AZNM8AtTbWL43aY71N2Q2LpyeBBYon23zAMuCrwfH3om) |
 
-### Commands
+#### Commands
 
 ```bash
 export OPENSSL_LIB_DIR=/usr/lib/x86_64-linux-gnu OPENSSL_INCLUDE_DIR=/usr/include
@@ -147,7 +221,7 @@ scripts/testnet/proof-links.sh <pid> …       # appendix below
 The runner only accepts account IDs ending in `.testnet`. Its worker is
 `near_workspaces::testnet()`, and it contains no mainnet configuration.
 
-### Testnet results, per test
+#### Testnet results, per test
 
 | Test | Run (pid) | Box | Result | Fee checks (fee account delta, exact) |
 | --- | --- | --- | --- | --- |
@@ -171,7 +245,7 @@ withdrew 99 + 84 yocto
 `get_constants` returned
 `{"RESERVE_BPS":1500,"SALE_UNDO_DELAY_BLOCKS":32,"MIN_RESERVE":"0","BPS_DENOMINATOR":"10000","FEE_BPS":100,"FEE_ACCOUNT":"onhire-fee-n12.testnet"}`.
 
-### First-run failures and how they were retried
+#### First-run failures and how they were retried
 
 **t4 (first run): FAIL, dropped transaction, not a contract failure.**
 Round 4.F ran to the end on chain: the collection was drained, the sale's
@@ -230,7 +304,7 @@ can still have a head inside the window.
   inspector re-attested, and `start_lease` then succeeded
   ([5UsxekT7…](https://testnet.nearblocks.io/txns/5UsxekT7WnuLkUyko4si8hFMq6ph8e5cEpPQyfeoUMZn)).
 
-### Nonce audit: open discrepancy (not explained)
+#### Nonce audit: open discrepancy (not explained)
 
 `scripts/testnet/audit-nonces.sh` (output in `logs/fee-testnet-audit.log`)
 compares each signer's on-chain key nonce with the txs the runner recorded:
@@ -278,7 +352,7 @@ only testnet NEAR. They do not change any result above. They do mean the
 audit is **not** clean for this run. Treat their origin as unknown until
 someone explains it.
 
-## Appendix: every recorded testnet tx, by run
+### Appendix: every recorded testnet tx, by run
 
 Generated with `scripts/testnet/proof-links.sh 3083535 3084444 3087797 3088783 3093691 3095625 3096945 3136943 3141046`.
 The first seven pids are the first run (t1–t7). The last two are the retry
