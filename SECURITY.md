@@ -6,8 +6,12 @@ There is no mainnet deployment and none is planned in this version.
 Known, disclosed properties:
 
 - The collection account on testnet keeps the deployer's access key (it is
-  also the minter). That key cannot move box tokens or box funds, but could
-  redeploy the collection contract.
+  also the minter). With the current code that key cannot move a box token.
+  By redeploying the collection it could rewrite the collection's ownership
+  registry and the code used for future boxes, but not any existing box's
+  state, NEAR or code. A box does ask the collection whether a sale's token
+  transfer went through, so a rewritten collection could decide whether a
+  sale in progress completes or is undone.
 - Box accounts have zero access keys and no upgrade, deploy, add-key or
   delete path.
 - `withdraw` pays a pull balance with a plain transfer. If the caller deletes

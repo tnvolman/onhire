@@ -18,7 +18,9 @@ container's rules inside the container itself.
 - Each container is an NFT in the Onhire collection **and** a keyless NEAR
   sub-account (`box-0042.<collection>`) running the box contract.
 - A lessee makes lease payments in native NEAR into the box. **15%** of every payment is
-  locked in a repair reserve that the owner can never withdraw.
+  locked in a repair reserve that the owner can never withdraw. Spending
+  the reserve on repairs isn't built yet, so in this version the reserve
+  can't be paid out at all (see [Known limitations](#known-limitations)).
 - A **1% protocol fee** is taken on every lease payment and every sale, out of
   the owner's (seller's) proceeds only, never out of the reserve. Lease payment of 100:
   reserve 15, fee 1, owner 84. Sale of 100: fee 1, seller 99.
@@ -148,7 +150,7 @@ stuck-lock steps 4.1–4.3 are proven in sandbox only.
 | Late callback after undo or a newer sale | Stale `sale_id` is a no-op (test 4, unit tests) |
 | Lease payment credited to the wrong owner mid-sale | `pay_hire` refused while locked (test 4) |
 | Named lessee takes a deposit the owner posted | The owner cannot post one (`start_lease` takes exactly 1 yocto); only the lessee posts the deposit, in `accept_lease`, and gets back that amount (test 5, unit tests) |
-| Lease recorded against an account that never agreed | A lease exists only after the named lessee's `accept_lease` (test 5, unit tests) |
+| Lease recorded against an account that never accepted an offer | A lease exists only after the named lessee's `accept_lease` (test 5, unit tests). `accept_lease` binds only the deposit, not the rate or duration (see [Known limitations](#known-limitations)) |
 | Owner attests their own box | Only the inspector, who can never be the owner (buyer ≠ inspector is enforced) (test 5) |
 | Owner withdraws the reserve | No such method; `withdraw` never touches it (tests 1, 6) |
 | Key holder drains the box or swaps code | Box accounts have zero keys; no add-key, upgrade, deploy or delete method (every step) |
@@ -200,9 +202,13 @@ anything. **Unchanged at 32.** It will never be lowered below 32.
   deploy or delete-account method. The global code is referenced by immutable
   hash, not by account, so nobody can change a box's code.
 - **The collection account on testnet still has the deployer's key.** The
-  deployer is also the prototype's minter. That key cannot move a box token
-  (test 3) and cannot touch box funds, but it could redeploy the collection
-  contract. Disclosed; acceptable for a testnet prototype only.
+  deployer is also the prototype's minter. With the current code that key
+  cannot move a box token (test 3). By redeploying the collection it could
+  rewrite the collection's ownership registry and the code used for future
+  boxes, but not any existing box's state, NEAR or code. One indirect effect
+  remains: a box asks the collection whether a sale's token transfer went
+  through, so a rewritten collection could decide whether a sale in progress
+  completes or is undone. Disclosed; acceptable for a testnet prototype only.
 
 ## Clarifications made while implementing spec v1.1
 
@@ -222,7 +228,9 @@ anything. **Unchanged at 32.** It will never be lowered below 32.
 - `nft_transfer_call` is gated to the box and then always fails; boxes only
   use `nft_transfer`.
 - Every user-facing state change asserts rule 14 plus 2,000 bytes of storage
-  headroom, so storage growth can never eat into user balances.
+  headroom, so storage growth can never eat into the reserve, deposits, pull
+  balances or locked buyer payments. Accrued, unswept lease payments
+  (`accrued_hire`) aren't in rule 14.
 
 ## Known limitations
 
@@ -231,11 +239,17 @@ version.
 
 - **The daily rate is recorded, not enforced.** `rate_per_day` is stored and
   must be above zero, but `pay_hire` accepts any amount above zero whenever
-  a lease is active and no sale is locked. The box does not track arrears (hire owed versus hire paid).
+  a lease is active and no sale is locked. The box does not track arrears (lease payments owed versus paid).
   `pay_hire` is still accepted after `end_ts`, until someone calls
   `off_hire`.
+- **`accept_lease` binds only the deposit amount.** The deposit the lessee
+  attaches must equal the offer's deposit, but `accept_lease` does not take
+  the rate or duration. An owner could `cancel_lease_offer` and re-offer
+  different terms before the lessee's acceptance lands, and the lessee would
+  accept terms they never saw. A later version should take the expected
+  rate, duration and deposit in `accept_lease`.
 - **The full deposit always goes back.** `off_hire` returns the whole
-  deposit to the lessee. Nothing is deducted for damage or unpaid hire.
+  deposit to the lessee. Nothing is deducted for damage or unpaid lease payments.
 - **Very small payments round to zero.** Splits round down. The 1% fee is
   zero on a lease payment or sale under 100 yocto, and the 15% reserve is
   zero on a lease payment under 7 yocto.

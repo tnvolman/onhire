@@ -14,7 +14,7 @@
 
 ## 1. What this is
 
-Onhire is a testnet prototype of container leasing. Each shipping container is an NFT that is also its own NEAR account. A lessee makes lease payments into the box. A cut of every lease payment is locked in a repair reserve the owner can never withdraw. The box refuses a new lease when its inspection has lapsed. A separate inspector attests inspections; the owner cannot attest their own box. The owner can list the box for a price, and a buyer can purchase it mid-lease. The lease, the reserve, and future lease payments move with the box. Already-earned lease payments and the sale price are credited to the seller as a pull balance. Each payout goes only to the account it is owed to, and the tests check this.
+Onhire is a testnet prototype of container leasing. Each shipping container is an NFT that is also its own NEAR account. A lessee makes lease payments into the box. A cut of every lease payment is locked in a repair reserve the owner can never withdraw. The box refuses a new lease when its inspection has lapsed. A separate inspector attests inspections; the owner cannot attest their own box. The owner can list the box for a price, and a buyer can purchase it mid-lease. The lease, the reserve, and future lease payments move with the box. Already-earned lease payments and the sale price are credited to the seller as a pull balance. Each withdrawal pays out only the caller's own balance, and the fee goes only to the fixed fee account. Tests 1, 5, 6 and 7 check this.
 
 The demo opens on the mid-lease sale, then a payment that goes to the new owner, a refused lease after inspection lapses, and (stretch) a depot paid from the reserve.
 
@@ -256,7 +256,7 @@ The six tests passing in sandbox, then the same six passing on testnet, with log
 | Late callback after undo or after a new sale | Stale `sale_id` is a no-op. Test 4. |
 | A lease payment arrives mid-sale and is credited to the wrong person | `pay_hire` rejected while locked. After finalize, the next lease payment goes to the buyer; after undo, to original owner. |
 | Named lessee ends the lease at once and withdraws a deposit the owner posted | The owner cannot post a deposit (`start_lease` takes exactly 1 yocto); only the lessee posts it, in `accept_lease`, and `off_hire` returns that same amount to the lessee. Unit tests; test 5. |
-| A lease is recorded against an account that never agreed to it | A lease exists only after the named lessee calls `accept_lease`. Unit tests; test 5. |
+| A lease is recorded against an account that never accepted an offer | A lease exists only after the named lessee calls `accept_lease`. Unit tests; test 5. `accept_lease` binds only the deposit, not the rate or duration; see Known limitations in the README. |
 | Owner attests their own inspection | Only inspector can attest. Test 5. |
 | Owner withdraws the reserve | No such path. Test 6. |
 | Anyone with a key drains the box or swaps code | No keys on box accounts; no upgrade or delete path. Asserted in every test. |
