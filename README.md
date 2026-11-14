@@ -242,6 +242,12 @@ version.
   a lease is active and no sale is locked. The box does not track arrears (lease payments owed versus paid).
   `pay_hire` is still accepted after `end_ts`, until someone calls
   `off_hire`.
+- **The on-chain token description overstates the rate.** Every minted box's
+  NEP-177 description reads "Lease payments, the repair reserve, inspection
+  and sale are enforced by its own keyless account." The daily rate is only
+  recorded, not enforced (see the bullet above). The collection has no
+  metadata update method, so this text can't change for existing tokens
+  without a metadata rewrite and a redeploy.
 - **`accept_lease` binds only the deposit amount.** The deposit the lessee
   attaches must equal the offer's deposit, but `accept_lease` does not take
   the rate or duration. An owner could `cancel_lease_offer` and re-offer
